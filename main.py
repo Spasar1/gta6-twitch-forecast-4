@@ -10,13 +10,17 @@ The forecast is built in two steps, never hour by hour from hour 1 alone:
    for the biggest launches, far higher for small ones whose unlock ramps
    through the day); a single global fit would understate a big launch's total.
 
-2. SPLIT. Each of the 10 closest comparables contributes its own day curve,
-   rescaled to this launch: its hourly viewers multiplied by
-   (predicted total for this launch) / (fitted total for that comparable).
-   The five quantiles of an hour are the empirical quantiles (linear
-   interpolation) of those 10 rescaled curves at that hour. The spread across
-   neighbours is the uncertainty: launches of a similar size disagree about
-   the shape of the day, and that disagreement is the forecast's width.
+2. SPLIT. Each of the 20 closest comparables contributes its own day curve,
+   rescaled to this launch. The rescale hedges two estimates of the same
+   scale factor: the fitted-total ratio (predicted total for this launch) /
+   (fitted total for that comparable), and the direct ratio (hour-1 here) /
+   (hour-1 there) — their geometric mean, half and half. The five quantiles
+   of an hour are the distance-weighted quantiles of those 20 rescaled
+   curves at that hour: a neighbour counts by a Gaussian kernel on
+   |log hour-1| distance (bandwidth 1.0 in log units), so a launch twice as
+   far away in size counts less. The spread across neighbours is the
+   uncertainty: launches of a similar size disagree about the shape of the
+   day, and that disagreement is the forecast's width.
 
 Nothing here is per-hour log-ratio quantiles, a normal/hierarchical model, or
 a pinball-loss regression. Standard library only, deterministic: every
@@ -73,7 +77,13 @@ SIGMA = 0.15
 # How many closest comparables (by |log hour-1| distance) fit the local
 # log-log total, and how many closest comparables supply rescaled day curves.
 FIT_NEIGHBOURS = 12
-CURVE_NEIGHBOURS = 10
+CURVE_NEIGHBOURS = 20
+# The curve quantiles weight each neighbour by a Gaussian kernel on its
+# |log hour-1| distance, bandwidth KERNEL_H in log units; and each curve's
+# rescale is the geometric mean of the fitted-total ratio and the direct
+# hour-1 ratio, weighted SCALE_BLEND toward the fitted-total ratio.
+KERNEL_H = 1.0
+SCALE_BLEND = 0.5
 
 
 def round2(x: float) -> float | int:
@@ -124,17 +134,34 @@ def launch_day(comp: dict) -> list[int] | None:
     return [viewers for _, viewers in series[start:start + 24]]
 
 
-def quantile(values: list[float], tau: float) -> float:
-    """The tau-quantile of values by linear interpolation (type 7)."""
-    ordered = sorted(values)
-    n = len(ordered)
-    if n == 1:
-        return ordered[0]
-    pos = tau * (n - 1)
-    low = int(math.floor(pos))
-    high = min(low + 1, n - 1)
-    frac = pos - low
-    return ordered[low] * (1.0 - frac) + ordered[high] * frac
+def weighted_quantile(pairs: list[tuple[float, float]], tau: float) -> float:
+    """The tau-quantile of weighted values by linear interpolation (type 7).
+
+    Each pair is (value, weight). The i-th order statistic sits at abscissa
+    (weight before it) / (total weight - weight of the largest point), so
+    with equal weights the abscissae are 0, 1/(n-1), ..., 1 -- exactly the
+    unweighted type-7 quantile. Nearer neighbours (larger weights) pull the
+    bracketing points closer together, so they count more.
+    """
+    ordered = sorted(pairs)
+    total = sum(w for _, w in ordered)
+    denom = total - ordered[-1][1]
+    if denom <= 0:
+        return ordered[len(ordered) // 2][0]
+    positions = []
+    cum = 0.0
+    for _, w in ordered:
+        positions.append(cum / denom)
+        cum += w
+    if tau <= positions[0]:
+        return ordered[0][0]
+    if tau >= positions[-1]:
+        return ordered[-1][0]
+    for i in range(1, len(positions)):
+        if tau <= positions[i]:
+            frac = (tau - positions[i - 1]) / (positions[i] - positions[i - 1]) if positions[i] > positions[i - 1] else 0.0
+            return ordered[i - 1][0] * (1.0 - frac) + ordered[i][0] * frac
+    return ordered[-1][0]
 
 
 def ols_loglog(days: list[tuple[int, int]]) -> tuple[float, float]:
@@ -186,21 +213,31 @@ def forecast_case(case: dict, name: str) -> dict:
     total_hat = math.exp(intercept + slope * log_p1)
 
     # Step 2: the split. Each of the CURVE_NEIGHBOURS closest comparables
-    # contributes its day curve rescaled to this launch: its hourly viewers
-    # times (predicted total here) / (fitted total there).
-    curves: list[list[float]] = []
+    # contributes its day curve rescaled to this launch. The rescale is the
+    # geometric mean of two estimates of the same scale factor: the
+    # fitted-total ratio (predicted total here) / (fitted total there), and
+    # the direct ratio (hour-1 here) / (hour-1 there). The fitted ratio can
+    # understate a big launch when the local fit is noisy; the direct ratio
+    # assumes the total is exactly proportional to hour 1; their mean hedges
+    # both biases. Each neighbour also carries a Gaussian weight on its
+    # |log hour-1| distance, so nearer launches count more.
+    neighbours: list[tuple[list[float], float]] = []
     for h1, _, hours in ranked[:CURVE_NEIGHBOURS]:
         fitted_here = math.exp(intercept + slope * math.log(h1))
-        scale = total_hat / fitted_here if fitted_here > 0 else 1.0
-        curves.append([viewers * scale for viewers in hours[1:24]])
+        scale_fit = total_hat / fitted_here if fitted_here > 0 else 1.0
+        scale_ratio = p1 / h1
+        scale = math.exp(SCALE_BLEND * math.log(scale_fit) + (1.0 - SCALE_BLEND) * math.log(scale_ratio))
+        distance = abs(math.log(h1) - log_p1)
+        weight = math.exp(-(distance * distance) / (2.0 * KERNEL_H * KERNEL_H))
+        neighbours.append(([viewers * scale for viewers in hours[1:24]], weight))
 
     hours_out = []
     for row in case["forecast"]:
         h = row["hour"]
         index = h - 2  # curves hold hours 2..24 in order
-        if 0 <= index < 23 and curves:
-            column = [curve[index] for curve in curves]
-            qs = [quantile(column, tau) for tau in LEVELS]
+        if 0 <= index < 23 and neighbours:
+            column = [(curve[index], weight) for curve, weight in neighbours]
+            qs = [weighted_quantile(column, tau) for tau in LEVELS]
         else:
             qs = [float(p1)] * len(LEVELS)
         qs = [min(1e9, max(1.0, q)) for q in qs]
